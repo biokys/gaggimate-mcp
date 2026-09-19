@@ -189,9 +189,34 @@ export function parseBinaryShot(buffer: Buffer, id: string): ShotData {
     }
   }
 
-  // Calculate sample data size
+  // Sample layout.
+  //
+  // Up to .slog v6 every field was a uint16, so a record was just
+  // fieldCount * 2 bytes. In v7 the tick (bit 0) widened to a uint32 holding
+  // milliseconds directly: the record grows by 2 bytes and the tick must no
+  // longer be multiplied by sampleInterval. Decoding a v7 file with the old
+  // layout shifts every field after the tick by 2 bytes *and* shortens the
+  // stride, so the drift accumulates across samples and the tail of the shot
+  // decodes as garbage (an unwritten 0xFFFF reads as 6553.5 bar).
   const fieldsPerSample = countSetBits(fieldsMask);
-  const sampleDataSize = fieldsPerSample * 2; // Each field is 2 bytes
+  const hasTick = (fieldsMask & (1 << FIELD_BITS.T)) !== 0;
+  const uint16SampleSize = fieldsPerSample * 2;
+  // Trust the file over the version number: payload / sampleCount is the real
+  // stride. The version is only the fallback, for a truncated file where the
+  // payload no longer divides evenly.
+  const payloadSize = view.byteLength - actualHeaderSize;
+  let tickIsUint32 = hasTick && version >= 7;
+  if (hasTick && sampleCount > 0 && payloadSize > 0) {
+    const observedStride = payloadSize / sampleCount;
+    if (Number.isInteger(observedStride)) {
+      if (observedStride === uint16SampleSize + 2) {
+        tickIsUint32 = true;
+      } else if (observedStride === uint16SampleSize) {
+        tickIsUint32 = false;
+      }
+    }
+  }
+  const sampleDataSize = uint16SampleSize + (tickIsUint32 ? 2 : 0);
   const totalSampleSize = sampleCount * sampleDataSize;
   const expectedSize = actualHeaderSize + totalSampleSize;
 
@@ -202,12 +227,16 @@ export function parseBinaryShot(buffer: Buffer, id: string): ShotData {
     );
   }
 
-  // Build field order based on mask
-  const fieldOrder: number[] = [];
-  for (let bit = 0; bit <= 12; bit++) {
-    if (fieldsMask & (1 << bit)) {
-      fieldOrder.push(bit);
-    }
+  // Build the record layout from the mask: each set bit gets its byte offset
+  // and width. Bits we have no definition for (v7 sets bit 13) still take up
+  // their slot, so the fields after them stay aligned.
+  const fieldLayout: Array<{ bit: number; offset: number; width: number }> = [];
+  let recordCursor = 0;
+  for (let bit = 0; bit < 32; bit++) {
+    if (!(fieldsMask & (1 << bit))) continue;
+    const width = bit === FIELD_BITS.T && tickIsUint32 ? 4 : 2;
+    fieldLayout.push({ bit, offset: recordCursor, width });
+    recordCursor += width;
   }
 
   // Parse samples
@@ -227,21 +256,28 @@ export function parseBinaryShot(buffer: Buffer, id: string): ShotData {
     }
 
     // Parse each field in this sample
-    fieldOrder.forEach((fieldBit, fieldIndex) => {
+    fieldLayout.forEach(({ bit: fieldBit, offset, width }) => {
       const fieldDef = FIELD_DEFS[fieldBit];
       if (!fieldDef) return;
 
-      const fieldOffset = sampleOffset + fieldIndex * 2;
+      const fieldOffset = sampleOffset + offset;
       let value: number;
 
-      if (fieldDef.type === 'int16') {
+      if (width === 4) {
+        value = view.getUint32(fieldOffset, true);
+      } else if (fieldDef.type === 'int16') {
         value = view.getInt16(fieldOffset, true);
       } else {
         value = view.getUint16(fieldOffset, true);
       }
 
       if (fieldDef.transform) {
-        sample[fieldDef.name] = fieldDef.transform(value, sampleInterval);
+        // A uint32 tick is already in milliseconds; only the old uint16 tick
+        // is a sample index that needs scaling by the interval.
+        sample[fieldDef.name] =
+          fieldBit === FIELD_BITS.T && tickIsUint32
+            ? value
+            : fieldDef.transform(value, sampleInterval);
       } else if (fieldDef.scale) {
         sample[fieldDef.name] = value / fieldDef.scale;
       } else {
