@@ -6,6 +6,7 @@ import WebSocket from "ws";
 import { parseBinaryIndex, indexToShotList } from "./parsers/binaryIndex.js";
 import { parseBinaryShot } from "./parsers/binaryShot.js";
 import { transformShotForAI } from "./transformers/shotTransformer.js";
+import { groupSettings } from "./machineSettings.js";
 // Configuration from environment
 const GAGGIMATE_HOST = process.env.GAGGIMATE_HOST || "localhost";
 const GAGGIMATE_PROTOCOL = process.env.GAGGIMATE_PROTOCOL || "ws";
@@ -424,6 +425,29 @@ async function fetchShotHistoryFromGaggimate(limit?: number, offset?: number) {
         throw error;
     }
 }
+// Fetch machine settings from Gaggimate HTTP API
+async function fetchMachineSettingsFromGaggimate(): Promise<Record<string, unknown>> {
+    try {
+        const url = `${HTTP_PROTOCOL}://${GAGGIMATE_HOST}/api/settings`;
+        const response = await fetch(url, {
+            method: 'GET',
+            headers: {
+                'Accept': 'application/json',
+            },
+            signal: AbortSignal.timeout(REQUEST_TIMEOUT),
+        });
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+        return await response.json() as Record<string, unknown>;
+    }
+    catch (error: any) {
+        if (error.name === 'AbortError') {
+            throw new Error(`Request timeout: No response from Gaggimate at ${GAGGIMATE_HOST}`);
+        }
+        throw error;
+    }
+}
 // Fetch a specific shot by ID from Gaggimate HTTP API
 async function fetchShotFromGaggimate(shotId: string) {
     try {
@@ -616,6 +640,21 @@ const TOOLS = [
                 },
             },
             required: ["shotId"],
+        },
+    },
+    {
+        name: "get_machine_settings",
+        description: "Get the machine's own configuration (temperature offset, PID constants, pressure calibration, pump model, timings, paired scale). " +
+            "Useful for interpreting shot curves: a temperature offset or PID tuning explains overshoot that a profile alone does not. " +
+            "Read-only; credentials and network settings are never returned.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                group: {
+                    type: "string",
+                    description: "Return only one group instead of all. One of: temperature, pressure, pump, timing, hardware, behavior, warnings (optional).",
+                },
+            },
         },
     },
     {
@@ -873,6 +912,34 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                             },
                         ],
                     };
+                }
+            }
+            case "get_machine_settings": {
+                try {
+                    const raw = await fetchMachineSettingsFromGaggimate();
+                    const grouped = groupSettings(raw);
+                    const requested = args?.group as string | undefined;
+                    if (requested && !(requested in grouped.settings)) {
+                        return errorResult(`Unknown settings group "${requested}". Available: ${Object.keys(grouped.settings).join(", ")}`, "UNKNOWN_GROUP");
+                    }
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: JSON.stringify({
+                                    settings: requested
+                                        ? { [requested]: grouped.settings[requested] }
+                                        : grouped.settings,
+                                    withheld_key_count: grouped.withheld_key_count,
+                                    note: grouped.note,
+                                    source: GAGGIMATE_HOST,
+                                }),
+                            },
+                        ],
+                    };
+                }
+                catch (error) {
+                    return errorResult(error instanceof Error ? error.message : "Failed to fetch machine settings", "SETTINGS_FETCH_FAILED");
                 }
             }
             case "save_profile": {
